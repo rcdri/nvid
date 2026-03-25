@@ -25,6 +25,8 @@ FILE			*infile;
  
 #define IVF_FILE_HDR_SZ  (32)
 #define IVF_FRAME_HDR_SZ (12)
+// Fallback frame count when the IVF header reports 0 frames
+#define DEFAULT_ALLOC_FRAMES 10000
   
 static void die(char *text) {
 	show_msgbox("Error", text);
@@ -56,7 +58,7 @@ int main(int argc, char **argv) {
 	uint8_t	frame_hdr[IVF_FRAME_HDR_SZ];
 	uint8_t	*frame = malloc(FRAME_SIZE*sizeof(uint8_t));
 	//vpx_codec_err_t  res;
- 
+
 	// Check arguments and open file
 	if(argc!=2){
 		cfg_register_fileext("ivf", "nvid");
@@ -78,6 +80,18 @@ int main(int argc, char **argv) {
 		 && file_hdr[0]=='D' && file_hdr[1]=='K' && file_hdr[2]=='I'
 		 && file_hdr[3]=='F'))
 		die("Not an IVF file!");
+
+	// Read FPS and frame count from IVF header for seek calculations
+	uint32_t fps_num = mem_get_le32(file_hdr + 16);
+	uint32_t fps_den = mem_get_le32(file_hdr + 20);
+	uint32_t total_frames = mem_get_le32(file_hdr + 24);
+	unsigned int frames_5sec = (fps_den > 0 && fps_num > 0) ? (unsigned int)((uint64_t)fps_num * 5 / fps_den) : 75;
+	if(frames_5sec == 0) frames_5sec = 1;
+
+	// Allocate frame position table for seeking (indexed by 0-based frame number)
+	unsigned int alloc_frames = total_frames > 0 ? total_frames + 1 : DEFAULT_ALLOC_FRAMES;
+	long *frame_pos = malloc(alloc_frames * sizeof(long));
+	if(!frame_pos) die("Out of memory");
  
 	//printf("Using %s\n",vpx_codec_iface_name(vpx_interface));
 	// Initialize codec
@@ -86,13 +100,20 @@ int main(int argc, char **argv) {
 	
 	unsigned int frame_sz;
 	uint8_t *output_frame_data = malloc(screen_size);
+	int do_rewind = 0, do_skip = 0;
 	// Read frame
-	while(fread(frame_hdr, 1, IVF_FRAME_HDR_SZ, infile) == IVF_FRAME_HDR_SZ) {
+	while(1) {
+		long current_pos = ftell(infile);
+		if(fread(frame_hdr, 1, IVF_FRAME_HDR_SZ, infile) != IVF_FRAME_HDR_SZ) break;
 		frame_sz = mem_get_le32(frame_hdr);
 		vpx_codec_iter_t  iter = NULL;
 		vpx_image_t	  *img;
   
+		// Store this frame's file position before incrementing frame_cnt
+		if((unsigned int)frame_cnt < alloc_frames)
+			frame_pos[frame_cnt] = current_pos;
 		frame_cnt++;
+
 		if(frame_sz > FRAME_SIZE)
 			die("Frame data too big for buffer");
 				
@@ -145,6 +166,48 @@ int main(int argc, char **argv) {
 				vpx_codec_destroy(&codec);
 				return 0;
 			}
+
+			// Pause: press 5 to pause, press 5 again to resume
+			if(isKeyPressed(KEY_NSPIRE_5)){
+				while(!isKeyPressed(KEY_NSPIRE_5)){
+					if(isKeyPressed(KEY_NSPIRE_ESC)){
+						vpx_codec_destroy(&codec);
+						return 0;
+					}
+				}
+				while(isKeyPressed(KEY_NSPIRE_5)){}
+			}
+
+			if(isKeyPressed(KEY_NSPIRE_4)) do_rewind = 1;
+			if(isKeyPressed(KEY_NSPIRE_6)) do_skip = 1;
+		}
+
+		// Rewind 5 seconds: seek back frames_5sec frames and reinitialize codec
+		if(do_rewind){
+			unsigned int cur = (unsigned int)frame_cnt;
+			unsigned int target = (cur > frames_5sec + 1) ? cur - 1 - frames_5sec : 0;
+			fseek(infile, frame_pos[target], SEEK_SET);
+			frame_cnt = (int)target;
+			vpx_codec_destroy(&codec);
+			vpx_codec_dec_init(&codec, vpx_interface, NULL, flags);
+			do_rewind = 0;
+		}
+
+		// Skip forward 5 seconds: advance file position without decoding, then reinit codec
+		if(do_skip){
+			unsigned int skip;
+			for(skip = 0; skip < frames_5sec; skip++){
+				long skip_pos = ftell(infile);
+				if(fread(frame_hdr, 1, IVF_FRAME_HDR_SZ, infile) != IVF_FRAME_HDR_SZ) break;
+				frame_sz = mem_get_le32(frame_hdr);
+				if((unsigned int)frame_cnt < alloc_frames)
+					frame_pos[frame_cnt] = skip_pos;
+				frame_cnt++;
+				if(fseek(infile, frame_sz, SEEK_CUR) != 0) break;
+			}
+			vpx_codec_destroy(&codec);
+			vpx_codec_dec_init(&codec, vpx_interface, NULL, flags);
+			do_skip = 0;
 		}
 	}
 	
